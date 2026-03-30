@@ -2,12 +2,14 @@ package src
 
 import (
 	context "context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"sync"
 	"time"
 
+	"github.com/syndtr/goleveldb/leveldb"
 	grpc "google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 )
@@ -22,80 +24,127 @@ func (a *BallotNum) GE(other *BallotNum) bool {
 	return a.ProposerId >= other.ProposerId
 }
 
-type Version struct {
-	mu       sync.Mutex
-	acceptor Acceptor
+// acceptorState is the JSON-serializable form of an Acceptor, persisted to LevelDB.
+type acceptorState struct {
+	LastBallotN          int64  `json:"last_ballot_n"`
+	LastBallotProposerId int64  `json:"last_ballot_proposer_id"`
+	VBallotN             int64  `json:"v_ballot_n"`
+	VBallotProposerId    int64  `json:"v_ballot_proposer_id"`
+	ValData              []byte `json:"val_data"`
+	HasVal               bool   `json:"has_val"`
 }
 
-type Versions map[int64]*Version
+// Per-key/version lock to serialize Paxos phases on the same instance.
+type versionLock struct {
+	mu sync.Mutex
+}
 
 type KVServer struct {
-	mu      sync.Mutex
-	Storage map[string]Versions
+	mu  sync.Mutex // protects versionLocks map
+	db  *leveldb.DB
+	locks map[string]*versionLock // key:ver -> lock
 }
 
-// mustEmbedUnimplementedPaxosKVServer implements [PaxosKVServer].
 func (s *KVServer) mustEmbedUnimplementedPaxosKVServer() {
 	panic("unimplemented")
 }
 
-func (s *KVServer) getLockedVersion(id *PaxosInstanceId) *Version {
+// dbKey builds a LevelDB key from a PaxosInstanceId: "paxos:<key>:<version>"
+func dbKey(id *PaxosInstanceId) string {
+	return fmt.Sprintf("paxos:%s:%d", id.Key, id.Version)
+}
+
+func (s *KVServer) getLock(id *PaxosInstanceId) *versionLock {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := id.Key
-	ver := id.Version
-	rec, found := s.Storage[key]
-	if !found {
-		rec = Versions{}
-		s.Storage[key] = rec
+	k := dbKey(id)
+	lk, ok := s.locks[k]
+	if !ok {
+		lk = &versionLock{}
+		s.locks[k] = lk
 	}
-	v, found := rec[ver]
-	if !found {
-		rec[ver] = &Version{
-			acceptor: Acceptor{
-				LastBallot: &BallotNum{},
-				VBallot:    &BallotNum{},
-				Val:        &Value{},
-			},
-		}
-		v = rec[ver]
+	return lk
+}
+
+func (s *KVServer) loadState(id *PaxosInstanceId) acceptorState {
+	raw, err := s.db.Get([]byte(dbKey(id)), nil)
+	if err != nil {
+		return acceptorState{}
 	}
-	v.mu.Lock()
-	return v
+	var st acceptorState
+	if err := json.Unmarshal(raw, &st); err != nil {
+		return acceptorState{}
+	}
+	return st
+}
+
+func (s *KVServer) saveState(id *PaxosInstanceId, st acceptorState) {
+	raw, err := json.Marshal(st)
+	if err != nil {
+		log.Printf("marshal state error: %v", err)
+		return
+	}
+	if err := s.db.Put([]byte(dbKey(id)), raw, nil); err != nil {
+		log.Printf("leveldb put error: %v", err)
+	}
+}
+
+func stateToAcceptor(st acceptorState) Acceptor {
+	lastBallot := &BallotNum{N: st.LastBallotN, ProposerId: st.LastBallotProposerId}
+	vBallot := &BallotNum{N: st.VBallotN, ProposerId: st.VBallotProposerId}
+	val := &Value{}
+	if st.HasVal {
+		val.Data = st.ValData
+	}
+	return Acceptor{
+		LastBallot: lastBallot,
+		VBallot:    vBallot,
+		Val:        val,
+	}
 }
 
 func (s *KVServer) Prepare(c context.Context, r *Proposer) (*Acceptor, error) {
-	v := s.getLockedVersion(r.InstanceId)
-	defer v.mu.Unlock()
+	lk := s.getLock(r.InstanceId)
+	lk.mu.Lock()
+	defer lk.mu.Unlock()
 
-	if r.Ballot.GE(v.acceptor.LastBallot) {
-		v.acceptor.LastBallot = r.Ballot
+	st := s.loadState(r.InstanceId)
+	lastBallot := &BallotNum{N: st.LastBallotN, ProposerId: st.LastBallotProposerId}
+
+	if r.Ballot.GE(lastBallot) {
+		st.LastBallotN = r.Ballot.N
+		st.LastBallotProposerId = r.Ballot.ProposerId
+		s.saveState(r.InstanceId, st)
 	}
 
-	reply := Acceptor{
-		LastBallot: &*v.acceptor.LastBallot,
-		VBallot:    &*v.acceptor.VBallot,
-		Val:        &*v.acceptor.Val,
-	}
-
+	reply := stateToAcceptor(st)
 	return &reply, nil
 }
 
 func (s *KVServer) Accept(c context.Context, r *Proposer) (*Acceptor, error) {
-	v := s.getLockedVersion(r.InstanceId)
-	defer v.mu.Unlock()
+	lk := s.getLock(r.InstanceId)
+	lk.mu.Lock()
+	defer lk.mu.Unlock()
 
-	reply := Acceptor{
-		LastBallot: &*v.acceptor.LastBallot,
+	st := s.loadState(r.InstanceId)
+	lastBallot := &BallotNum{N: st.LastBallotN, ProposerId: st.LastBallotProposerId}
+
+	replyLast := &BallotNum{N: st.LastBallotN, ProposerId: st.LastBallotProposerId}
+
+	if r.Ballot.GE(lastBallot) {
+		st.LastBallotN = r.Ballot.N
+		st.LastBallotProposerId = r.Ballot.ProposerId
+		st.VBallotN = r.Ballot.N
+		st.VBallotProposerId = r.Ballot.ProposerId
+		if r.Val != nil {
+			st.ValData = r.Val.Data
+			st.HasVal = true
+		}
+		s.saveState(r.InstanceId, st)
 	}
 
-	if r.Ballot.GE(v.acceptor.LastBallot) {
-		v.acceptor.LastBallot = r.Ballot
-		v.acceptor.Val = r.Val
-		v.acceptor.VBallot = r.Ballot
-	}
-
+	reply := Acceptor{LastBallot: replyLast}
 	return &reply, nil
 }
 
@@ -109,10 +158,20 @@ func ServeAcceptors(acceptorIds []int64) []*grpc.Server {
 			log.Fatalf("failed to listen: %v", err)
 		}
 
+		// Each acceptor gets its own LevelDB database
+		dbPath := fmt.Sprintf("/tmp/paxoskv-leveldb-%d", aid)
+		db, err := leveldb.OpenFile(dbPath, nil)
+		if err != nil {
+			log.Fatalf("failed to open leveldb: %v", err)
+		}
+
 		s := grpc.NewServer()
-		RegisterPaxosKVServer(s, &KVServer{Storage: map[string]Versions{}})
+		RegisterPaxosKVServer(s, &KVServer{
+			db:    db,
+			locks: map[string]*versionLock{},
+		})
 		reflection.Register(s)
-		log.Printf("Acceptor %d listening at %v", aid, lis.Addr())
+		log.Printf("Acceptor %d listening at %v (db: %s)", aid, lis.Addr(), dbPath)
 
 		servers = append(servers, s)
 		go s.Serve(lis)
@@ -130,14 +189,12 @@ func (p *Proposer) Phase1(acceptorIds []int64, quorum int) (*Value, *BallotNum, 
 
 	for _, reply := range replies {
 		if !p.Ballot.GE(reply.LastBallot) {
-			// 请求被拒绝了
 			if reply.LastBallot.GE(higherBallot) {
 				higherBallot = reply.LastBallot
 			}
 			continue
 		}
 
-		// 只有当 acceptor 确实投过票（VBallot 不为零值）时，才记录已投票的值
 		if reply.VBallot != nil && (reply.VBallot.N > 0 || reply.VBallot.ProposerId > 0) {
 			if reply.VBallot.GE(maxVoted.VBallot) {
 				maxVoted = reply
@@ -146,7 +203,6 @@ func (p *Proposer) Phase1(acceptorIds []int64, quorum int) (*Value, *BallotNum, 
 		}
 
 		ok += 1
-
 		if ok >= quorum {
 			if hasVoted {
 				return maxVoted.Val, nil, nil
@@ -165,7 +221,6 @@ func (p *Proposer) Phase2(acceptorIds []int64, quorum int) (*BallotNum, error) {
 
 	for _, reply := range replies {
 		if !p.Ballot.GE(reply.LastBallot) {
-			// rejected
 			if reply.LastBallot.GE(higherBallot) {
 				higherBallot = reply.LastBallot
 			}
@@ -228,7 +283,6 @@ func (p *Proposer) RunPaxos(acceptorIds []int64, val *Value) *Value {
 		}
 
 		if p.Val == nil {
-			// 读操作，只执行 Phase 1
 			return nil
 		}
 

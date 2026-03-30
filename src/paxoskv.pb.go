@@ -318,7 +318,7 @@ const file_paxoskv_proto_rawDesc = "" +
 	"\x03Val\x18\x03 \x01(\v2\x0e.paxoskv.ValueR\x03Val2n\n" +
 	"\aPaxosKV\x121\n" +
 	"\aPrepare\x12\x11.paxoskv.Proposer\x1a\x11.paxoskv.Acceptor\"\x00\x120\n" +
-	"\x06Accept\x12\x11.paxoskv.Proposer\x1a\x11.paxoskv.Acceptor\"\x00B\aZ\x05./srcb\x06proto3"
+	"\x06Accept\x12\x11.paxoskv.Proposer\x1a\x11.paxoskv.Acceptor\"\x00B\x1fZ\x1dgithub.com/ludics/paxoskv/srcb\x06proto3"
 
 var (
 	file_paxoskv_proto_rawDescOnce sync.Once
